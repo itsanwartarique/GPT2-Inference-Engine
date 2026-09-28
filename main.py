@@ -25,9 +25,9 @@ class SelfAttention:
      self.c_proj_bias= c_proj_bias
      self.n_head= n_head
 
-  def forward(self,x):
+  def forward(self,x,past_k=None,past_v=None):
     B, T, C = x.shape
-    
+
     qkv = x @ self.c_attn_weight + self.c_attn_bias
 
     Q, K, V = torch.split(
@@ -41,6 +41,12 @@ class SelfAttention:
     Q = Q.view(B, T, self.n_head, head_dim).transpose(1, 2)
     K = K.view(B, T, self.n_head, head_dim).transpose(1, 2)
     V = V.view(B, T, self.n_head, head_dim).transpose(1, 2)
+
+    if past_k is not None:
+        K = torch.cat([past_k,K],dim=2)
+
+    if past_v is not None:
+        V = torch.cat([past_v,V],dim=2)
 
     scores = (
         Q @ K.transpose(-2, -1)
@@ -78,7 +84,8 @@ class SelfAttention:
         + self.c_proj_bias
     )
 
-    return out
+
+    return out,K,V
 
 class MLP:
   def __init__(self,fc_weight,fc_bias,proj_weight,proj_bias):
@@ -127,11 +134,11 @@ class TransformerBlock:
   )
 
 
-  def forward(self,x):
+  def forward(self,x,past_k=None,past_v=None):
 
     h = self.ln1.forward(x)
 
-    attn = self.self_attention.forward(h)
+    attn,K,V = self.self_attention.forward(h,past_k,past_v)
 
     x = x + attn
 
@@ -141,7 +148,7 @@ class TransformerBlock:
 
     x = x + mlp_out
 
-    return x
+    return x,K,V
 
 class GPT2:
   def __init__(self,tokenizer,model):
@@ -169,40 +176,63 @@ class GPT2:
     return text
 
   # token and positional embeddings
-  def embeddings(self,tokens):
+  def embeddings(
+    self,
+    tokens,
+    position_offset=0
+  ):
+
     if isinstance(tokens, list):
-          tokens = torch.tensor([tokens])
+        tokens = torch.tensor([tokens])
+
     wte = self.model.transformer.wte.weight
     wpe = self.model.transformer.wpe.weight
 
     token_embeddings = wte[tokens]
 
     T = tokens.size(1)
-    positions = torch.arange(T, device=tokens.device)
+
+    positions = torch.arange(
+        position_offset,
+        position_offset + T,
+        device=tokens.device
+    )
 
     positional_embeddings = wpe[positions]
+
     return token_embeddings + positional_embeddings
 
-  def transformer(self, x):
+  def transformer(self, x,past_keys=None,past_values=None):
 
-    for block in self.blocks:
-        x = block.forward(x)
+    if past_keys is None:
+        past_keys = [None]* len(self.blocks)
+
+    if past_values is None:
+       past_values = [None]* len(self.blocks)
+
+    new_keys= []
+    new_values= []
+
+    for i,block in enumerate(self.blocks):
+        x,k,v = block.forward(x,past_keys[i],past_values[i])
+        new_keys.append(k)
+        new_values.append(v)
 
     x = self.ln_f.forward(x)
 
-    return x
+    return x,new_keys,new_values
 
   def generate(self, prompt, max_new_tokens=10):
 
         tokens = self.tokenize(prompt)
 
+        x = self.embeddings(tokens)
+
+        x,past_keys,past_values = self.transformer(x)
+
+        logits = x @ self.model.transformer.wte.weight.T
+
         for _ in range(max_new_tokens):
-
-            x = self.embeddings(tokens)
-
-            x = self.transformer(x)
-
-            logits = x @ self.model.transformer.wte.weight.T
 
             next_token_logits = logits[:, -1, :]
 
@@ -214,9 +244,31 @@ class GPT2:
             next_token = torch.multinomial(
                 probs,
                 num_samples=1
-            ).item()
+            )
 
-            tokens.append(next_token)
+            token_id = next_token.item()
+
+            tokens.append(token_id)
+
+            # New Token
+            token_tensor = torch.tensor(
+                [[token_id]]
+            )
+
+            position_offset = len(tokens) - 1
+
+            x = self.embeddings(
+                token_tensor,
+                position_offset
+            )
+
+            x,past_keys,past_values = self.transformer(
+                x,
+                past_keys,
+                past_values
+            )
+
+            logits = x@ self.model.transformer.wte.weight.T
 
         return self.detokenize(tokens)
 
@@ -225,7 +277,6 @@ def main():
 
     model = GPT2LMHeadModel.from_pretrained("gpt2")
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-
     gpt = GPT2(tokenizer, model)
 
     prompt = input("> ")
