@@ -52,18 +52,20 @@ class SelfAttention:
         Q @ K.transpose(-2, -1)
     ) / math.sqrt(head_dim)
 
-    mask = torch.tril(
-        torch.ones(
-            T,
-            T,
-            device=x.device
-        )
-    )
 
-    scores = scores.masked_fill(
-        mask == 0,
-        float("-inf")
-    )
+    if past_k is None:
+        mask = torch.tril(
+            torch.ones(
+                T,
+                T,
+                device=x.device
+            )
+        )
+
+        scores = scores.masked_fill(
+            mask == 0,
+            float("-inf")
+        )
 
     weights = torch.softmax(
         scores,
@@ -165,6 +167,8 @@ class GPT2:
             model.transformer.ln_f.bias
         )
 
+    self.lm_head = model.transformer.wte.weight.T
+
   # texts -> tokens
   def tokenize(self,text):
     tokens = self.tokenizer.encode(text)
@@ -222,31 +226,61 @@ class GPT2:
 
     return x,new_keys,new_values
 
-  def generate(self, prompt, max_new_tokens=10):
+  def sample(self,next_token_logits):
+    k = 50
+    temperature = 0.8
 
+    values, indices = torch.topk(
+        next_token_logits,
+        k
+    )
+
+    probs = torch.softmax(
+        values / temperature,
+        dim=-1
+    )
+
+    sample_idx = torch.multinomial(
+        probs,
+        1
+    )
+
+    next_token = torch.gather(
+        indices,
+        1,
+        sample_idx
+    )
+
+    return next_token
+
+
+
+  @torch.no_grad()
+  def generate(self, prompt,max_new_token=100):
+
+        # prompt -> tokens
         tokens = self.tokenize(prompt)
 
+        # tokens -> embeddings
         x = self.embeddings(tokens)
 
+        # embeddings -> context
         x,past_keys,past_values = self.transformer(x)
 
-        logits = x @ self.model.transformer.wte.weight.T
+        # context -> logits
+        logits = x @ self.lm_head
 
-        for _ in range(max_new_tokens):
+        for _ in range(max_new_token):
 
             next_token_logits = logits[:, -1, :]
 
-            probs = torch.softmax(
-                next_token_logits,
-                dim=-1
-            )
-
-            next_token = torch.multinomial(
-                probs,
-                num_samples=1
-            )
+            # logits -> next token
+            next_token = self.sample(next_token_logits=next_token_logits)
 
             token_id = next_token.item()
+
+            if token_id == self.tokenizer.eos_token_id:
+                break
 
             tokens.append(token_id)
 
@@ -256,6 +290,9 @@ class GPT2:
             )
 
             position_offset = len(tokens) - 1
+
+            if position_offset >= 1024:
+                break
 
             x = self.embeddings(
                 token_tensor,
@@ -268,7 +305,7 @@ class GPT2:
                 past_values
             )
 
-            logits = x@ self.model.transformer.wte.weight.T
+            logits = x@ self.lm_head
 
         return self.detokenize(tokens)
 
@@ -282,8 +319,7 @@ def main():
     prompt = input("> ")
 
     text = gpt.generate(
-        prompt,
-        max_new_tokens=20
+        prompt
     )
 
     print(text)
